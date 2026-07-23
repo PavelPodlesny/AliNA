@@ -4,6 +4,7 @@ sys.path.append('/home/pavel/repos/AliNA')
 
 # import json
 # import fire
+import signal
 import torch
 import random
 import mlflow
@@ -25,6 +26,12 @@ from train_utils import (
 
 # Suppress FutureWarnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
+
+class TerminationSignal(Exception):
+    pass
+
+def _handle_sigterm(signum, frame):
+    raise TerminationSignal("Received SIGTERM")
 
 def set_seed(SEED: int) -> None:
     random.seed(SEED)
@@ -52,7 +59,7 @@ def main(cfg: DictConfig):
     valid_data_path = config["data"]["valid_data_path"].split(":")
     checkpoint_path = config["checkpoint_path"]
     
-    work_dir        = Path(config["work_dir"])
+    work_dir = Path(config["work_dir"])
     
     work_dir.mkdir(parents=True, exist_ok=True)
     
@@ -108,6 +115,7 @@ def main(cfg: DictConfig):
     mlflow.log_params(config)
 
     checkpointer = modules['checkpointer']
+    signal.signal(signal.SIGTERM, _handle_sigterm)
     try:
         logger.info("Start train loop")
         train(
@@ -119,11 +127,15 @@ def main(cfg: DictConfig):
         )
         print()
         logger.success("Training finished successfully")
-        
+
     except KeyboardInterrupt:
         logger.warning("Training interrupted by user (Ctrl+C)")
         checkpointer("stopped")
-        
+
+    except TerminationSignal:
+        logger.warning("Training interrupted by SIGTERM")
+        checkpointer("stopped")
+
     except Exception as e:
         logger.error(f"Training failed due to error: {e}")
         checkpointer("error")

@@ -13,7 +13,7 @@ from torch.nn import Module
 from pathlib import Path
 from typing import Any
 
-from alina.utils import ClasMetrics, PredMetrics, MaskedCELoss, CELoss, get_cexplr_scheduler, Checkpointer, GpuWatch
+from alina.utils import ClasMetrics, PredMetrics, LossFn, get_cexplr_scheduler, Checkpointer, GpuWatch
 from alina.dataset import AlinaDataset, collate_fn
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
@@ -83,6 +83,8 @@ def setup_train_modules(
     batch_size   = config['const']['BATCH_SIZE']
     model_name   = config['run_name']
     model_task   = config['special_params']['model_task']
+    loss_fn_type   = config['special_params']['loss_fn']
+    loss_fn_params = config['special_params'].get('loss_fn_params', {})
     
     assert model_task in ["p","c"], f"unknown model task: expected 'p' or 'c', got {model_task}"
     
@@ -102,10 +104,19 @@ def setup_train_modules(
         
     ### setup train modules 
     modules = dict()
+    assert (
+        (model_task=="c") and \
+        (loss_fn_type in ["MaskedCELoss", "WeightedMaskedCELoss"])
+        ) or (
+            (model_task=="p") and (loss_fn_type in ["CELoss"])
+        ), f"Invalid 'model_task'/'loss_fn_type' combination, got: {model_task}, {loss_fn_type}"
+
+    loss_fn = LossFn(loss_fn_type, **loss_fn_params)
+
     if model_task == "c":
-        loss_fn, metrics_fn = MaskedCELoss, ClasMetrics
+        metrics_fn = ClasMetrics
     elif model_task == "p":
-        loss_fn, metrics_fn = CELoss, PredMetrics
+        metrics_fn = PredMetrics
         
     modules['optim']         = optim
     modules['scaler']        = torch.amp.GradScaler("cuda")
@@ -180,6 +191,7 @@ def train(model: Module,
     MAX_TRAIN_STEPS = train_const['MAX_TRAIN_STEPS']
     VALID_EVERY     = train_const['VALID_EVERY']
     LOG_EVERY       = train_const['LOG_EVERY']
+    SAVE_EVERY      = train_const['SAVE_EVERY']
     CLIP_GRAD       = train_const['CLIP_GRAD']
     DEVICE_IDX      = train_const['DEVICE_IDX']
     BATCH_SIZE      = train_const['BATCH_SIZE']
@@ -272,7 +284,10 @@ def train(model: Module,
                             
                         if label == save_by:
                             checkpointer.save_by_metric(f"{label}_step{train_step}", vmetrics["Fscore"])
-                
+
+                if SAVE_EVERY is not None and train_step%SAVE_EVERY==0:
+                    checkpointer(f"step{train_step}")
+
                 metrics = {}
                 mloss = 0
 
