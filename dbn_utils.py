@@ -353,11 +353,11 @@ def setup_logging(log_file: Optional[str]):
 def prepare_nas_for_alina(
     path: str,
     names: Optional[List[str]] = None
-    ): -> Tuple[List[any], List[str]]:
+    ) -> Tuple[List[any], List[str]]:
     # Summary. Read RNA sequences from a file and filter them:
     # (len<=256) & (2nd structure, e.g. there're base pairs) & (only AUGC bases, e.g. RNA)
     VALID_BASES = set("AUGC")
-    filtered_names = []
+    dropped_names = []
     
     if names is not None:
         names_set = set(names)
@@ -374,7 +374,7 @@ def prepare_nas_for_alina(
                 if names_set is None or na.name in names_set:
                     nas.append(na)
                     
-    print(f"Read NA objects: {len(nas)}")
+    print(f"Read NA objects: {len(nas)}/{len(names_set)}")
     if not nas:
         print("No NA objects found.")
         return [], []
@@ -397,17 +397,18 @@ def prepare_nas_for_alina(
         ):
             nas_fltr.append(na_)
         else:
-            filtered_names.append(na_.name)
+            dropped_names.append(na_.name)
             
-    print(f"Filtered out: {len(filtered_names)}/{len(nas)}")
+    print(f"Filtered out: {len(dropped_names)}/{len(nas)}")
     print(f"Left: {len(nas_fltr)}/{len(nas)}")
     
-    return nas_fltr, filtered_names
+    return nas_fltr, dropped_names
 
 def prepare_ds_for_alina(path: str,
-                         nas: List[any]):
+                         nas: List[any],
+                         dimer_embeddings: bool = False):
     
-    ds = AlinaDataset(nas, dimer_embeddings=False)
+    ds = AlinaDataset(nas, dimer_embeddings=dimer_embeddings)
     ds.precache()
     ds.save(path)
 

@@ -28,9 +28,9 @@ def _pair_metrics(target_na, pred_na, prob):
     recall = tp / (tp + fn + 1e-7)
     fscore = 2 * tp / (2 * tp + fn + fp + 1e-7)
 
-    tp_probs = [float(prob[i, j]) for i, j in tp_pairs]
-    fp_probs = [float(prob[i, j]) for i, j in fp_pairs]
-    fn_probs = [float(prob[i, j]) for i, j in fn_pairs]
+    tp_probs = [sym_max(prob, i, j) for i, j in tp_pairs]
+    fp_probs = [sym_max(prob, i, j) for i, j in fp_pairs]
+    fn_probs = [sym_max(prob, i, j) for i, j in fn_pairs]
 
     return fscore, precision, recall, tp_probs, fp_probs, fn_probs
 
@@ -55,17 +55,23 @@ def _eval_at_threshold(model, target_nas, probs, threshold):
 
 def _hist_with_ticks(ax, values, title):
     values = np.asarray(values)
-    ax.hist(values, bins=30)
+    ax.hist(values, bins=50)
     mean = values.mean()
     q25, q50, q75 = np.percentile(values, [25, 50, 75])
-    for v, label in [(mean, "mean"), (q25, "Q25"), (q50, "Q50"), (q75, "Q75")]:
-        ax.axvline(v, linestyle="--", label=f"{label}={v:.3f}")
+    for v, label, c in [(mean, "mean", "red"), (q25, "Q25", "green"), (q50, "Q50", "green"), (q75, "Q75", "green")]:
+        ax.axvline(v, linestyle="--", label=f"{label}={v:.3f}", color=c)
+
+    xticks = np.round(np.arange(0,1.01,0.1),1)
+    ax.set_xticks(xticks)
+    ax.set_xticklabels(xticks, rotation=45, ha='right')
+    
     ax.set_title(title)
+    ax.set_ylabel('Counts')
     ax.legend(fontsize=8)
 
 
-def _plot_diagnostics(fscores, precisions, recalls, tp_probs, fp_probs, fn_probs):
-    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+def _plot_diagnostics(fscores, precisions, recalls, tp_probs, fp_probs, fn_probs, best_threshold):
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8), sharey='row', sharex='col')
     _hist_with_ticks(axes[0, 0], fscores, "F-score")
     _hist_with_ticks(axes[0, 1], precisions, "Precision")
     _hist_with_ticks(axes[0, 2], recalls, "Recall")
@@ -74,7 +80,13 @@ def _plot_diagnostics(fscores, precisions, recalls, tp_probs, fp_probs, fn_probs
         axes[1], (tp_probs, fp_probs, fn_probs), ("TP probs", "FP probs", "FN probs")
     ):
         if len(probs) > 0:
-            ax.hist(probs, bins=30)
+            ax.hist(probs, bins=50, range=(0.0,1.0))
+            ax.axvline(best_threshold, linestyle="--", label=f"quant th={best_threshold}", color='red')
+            xticks = np.round(np.arange(0,1.01,0.1),1)
+            ax.set_xticks(xticks)
+            ax.set_xticklabels(xticks, rotation=45, ha='right')
+            ax.set_ylabel('Counts')
+            
         ax.set_title(title)
 
     fig.tight_layout()
@@ -99,6 +111,7 @@ def evaluate(
     threshold: Union[float, List[float]] = 0.5,
     batch_size: int = 8,
     device: Union[str, torch.device] = "cpu",
+    plot: bool = True
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
 
     model = alina.AliNA.load(path=checkpoint_path)
@@ -122,13 +135,18 @@ def evaluate(
     else:
         results = {t: _eval_at_threshold(model, target_nas, probs, t) for t in thresholds}
         best_threshold = max(results, key=lambda t: results[t][0].mean())
-        _plot_threshold_sweep(thresholds, results, best_threshold)
+        if plot:
+            _plot_threshold_sweep(thresholds, results, best_threshold)
         fscores, precisions, recalls, tp_probs, fp_probs, fn_probs = results[best_threshold]
 
     print(
         f"threshold={best_threshold}  fscore={fscores.mean():.4f}  "
         f"precision={precisions.mean():.4f}  recall={recalls.mean():.4f}"
     )
-    _plot_diagnostics(fscores, precisions, recalls, tp_probs, fp_probs, fn_probs)
+    if plot:
+        _plot_diagnostics(fscores, precisions, recalls, tp_probs, fp_probs, fn_probs, best_threshold)
 
     return fscores, precisions, recalls
+
+def sym_max(m, i, j):
+    return max(float(m[i, j]), float(m[j, i]))
