@@ -36,11 +36,11 @@ def main():
     
     parser.add_argument('-m', '--mode', type=str, 
                         choices=['seq', 'file'], default='seq', 
-                        help='Prediction mode: "seq" - for single RNA sequence passed to command line. "file" - for multiple predictions from .fasta file.')
-                        
-    parser.add_argument('-i', '--input', type=str, 
-                        required=True, metavar='<Sequence or Fasta file>', 
-                        help='RNA sequence or path to the fasta file.')
+                        help='Prediction mode: "seq" - for single RNA or DNA sequence passed to command line. "file" - for multiple predictions from .fasta file.')
+
+    parser.add_argument('-i', '--input', type=str,
+                        required=True, metavar='<Sequence or Fasta file>',
+                        help='RNA or DNA sequence or path to the fasta file.')
                         
     parser.add_argument('-o', '--out', type=str, metavar='<Output file>',
                         help='Path to the output file for "file" mode. Default - Prediction_<input file name>.')

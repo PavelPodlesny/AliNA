@@ -354,9 +354,9 @@ def prepare_nas_for_alina(
     path: str,
     names: Optional[List[str]] = None
     ) -> Tuple[List[any], List[str]]:
-    # Summary. Read RNA sequences from a file and filter them:
-    # (len<=256) & (2nd structure, e.g. there're base pairs) & (only AUGC bases, e.g. RNA)
-    VALID_BASES = set("AUGC")
+    # Summary. Read RNA/DNA sequences from a file and filter them:
+    # (len<=256) & (2nd structure, e.g. there're base pairs) & (only AUGCT bases)
+    VALID_BASES = set("AUGCT")
     dropped_names = []
     
     if names is not None:
@@ -382,22 +382,14 @@ def prepare_nas_for_alina(
 
     nas_fltr = []
     for na in nas:
-        if 'T' in na.seq:
-            na_ = nsk.NA(
-                na.seq.replace('T','U'),
-                na.struct,
-                name = na.name)
-        else:
-            na_ = na
-
         if (
-            len(na_) <= 256 and
-            len(na_.pairs)!=0 and
-            set(na_.seq).issubset(VALID_BASES)
+            len(na) <= 256 and
+            len(na.pairs)!=0 and
+            set(na.seq).issubset(VALID_BASES)
         ):
-            nas_fltr.append(na_)
+            nas_fltr.append(na)
         else:
-            dropped_names.append(na_.name)
+            dropped_names.append(na.name)
             
     print(f"Filtered out: {len(dropped_names)}/{len(nas)}")
     print(f"Left: {len(nas_fltr)}/{len(nas)}")

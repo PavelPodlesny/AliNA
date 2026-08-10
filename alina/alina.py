@@ -109,7 +109,7 @@ class AliNA(Model):
                 raise SequenceError(f'Sequence length must be in range (0, 256], got {len(na)}')
 
             seq = na if isinstance(na, str) else na.seq
-            rn = set(seq) - {'A', 'U', 'G', 'C'}
+            rn = set(seq) - {'A', 'U', 'T', 'G', 'C'}
             if len(rn)!=0:
                 raise SequenceError(f'Sequence contains unknown symbols: {tuple(rn)}')
 
