@@ -373,8 +373,9 @@ def prepare_nas_for_alina(
             if (na is not None):
                 if names_set is None or na.name in names_set:
                     nas.append(na)
-                    
-    print(f"Read NA objects: {len(nas)}/{len(names_set)}")
+
+    n = len(names_set) if names_set else '-'
+    print(f"Read NA objects: {len(nas)}/{n}")
     if not nas:
         print("No NA objects found.")
         return [], []

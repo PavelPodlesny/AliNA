@@ -28,22 +28,14 @@ def set_seeds(seed: int = 42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
 
-def load_checkpoint(path, device): #!!!!
-    state = torch.load(path, map_location=device, weights_only=False)
+def load_model(path, device):
+    state = torch.load(path, map_location=device, weights_only=True)
     model = alina.AliNA(
          model_parameters = state["model_params"],
          dimer_embeddings = state["dimer_embeddings"],
          center_pad = state["center_pad"] )
     model.load_state_dict(state["model_state_dict"])
-    optim = torch.optim.AdamW(model.parameters(), lr=1)
-    optim.load_state_dict(state["optim_state_dict"])
-
-    for state in optim.state.values():
-        for k, v in state.items():
-            if isinstance(v, torch.Tensor):
-                state[k] = v.to(device)
-    
-    return (model, optim)
+    return model
 
 class Checkpointer:
     def __init__(self, dir_path, model, model_params, optim, maximize_metrics):
@@ -79,7 +71,7 @@ class Checkpointer:
         if not save_model:
             return
             
-        best_name = f"best_val={value:.4f}_{name}"
+        best_name = f"best_val{value:.4f}_{name}"
         if self.best_model_name is not None:
             os.remove(self.dir_path/f"{self.best_model_name}.pth")
         self.best_value = value
@@ -164,12 +156,12 @@ def validate(model, loader, loss_fn, device): #!!!
     recall, precision, Fscore = AlinaMetrics(val_pred, val_y)
     return loss, recall, precision, Fscore
 
-def train(model, train_loader, valid_loader, device, optim, loss_fn,
+def train(model, train_loader, valid_loaders, device, optim, loss_fn,
           lr_scheduler, scaler, checkpointer, log_fn,
           LOG_EVERY, VALID_EVERY, max_train_steps,
-          grad_acum, clip_grad):
-    #model, train_loader, valid_loader, device, optim, loss_fn, max_train_steps 
-    #lr_scheduler, scaler, checkpointer, grad_acum, LOG_EVERY, VALID_EVERY
+          grad_acum, clip_grad, SAVE_EVERY=None):
+    #model, train_loader, valid_loaders, device, optim, loss_fn, max_train_steps
+    #lr_scheduler, scaler, checkpointer, grad_acum, LOG_EVERY, VALID_EVERY, SAVE_EVERY
     global_step = 0
     train_step = 0
     ep = 0
@@ -227,16 +219,21 @@ def train(model, train_loader, valid_loader, device, optim, loss_fn,
                     if train_step%VALID_EVERY==0:
                         model.eval()
                         print("\n--- Validation")
-                        loss, recall, precision, Fscore = validate(model, valid_loader, loss_fn, device)
+                        fscores = []
+                        for name, valid_loader in valid_loaders.items():
+                            loss, recall, precision, Fscore = validate(model, valid_loader, loss_fn, device)
+                            fscores.append(Fscore)
+                            log_fn(f'valid_Loss/{name}', float(loss), train_step)
+                            log_fn(f'valid_recall/{name}', recall, train_step)
+                            log_fn(f'valid_precision/{name}', precision, train_step)
+                            log_fn(f'valid_Fscore/{name}', Fscore, train_step)
                         model.train()
-                        log_fn('valid_Loss', float(loss), train_step)
-                        log_fn('valid_recall', recall, train_step)
-                        log_fn('valid_precision', precision, train_step)
-                        log_fn('valid_Fscore', Fscore, train_step)
-                        checkpointer.save_by_metric(f"step={train_step}", Fscore)
-    
-                    # if train_step%SAVE_EVERY==0:
-                    #     checkpointer(f"step={train_step}")
+                        mean_Fscore = sum(fscores) / len(fscores)
+                        log_fn('valid_Fscore/mean', mean_Fscore, train_step)
+                        checkpointer.save_by_metric(f"step{train_step}", mean_Fscore)
+
+                    if SAVE_EVERY is not None and train_step%SAVE_EVERY==0:
+                        checkpointer(f"step{train_step}")
     
                 itps = 1/(time.time() - iter_start_time)
                 iter_start_time = time.time()
@@ -252,7 +249,7 @@ def train(model, train_loader, valid_loader, device, optim, loss_fn,
         print("\n---   Stopped   ---")
     
     mlflow.end_run()
-    checkpointer(f"step={train_step}")
+    checkpointer(f"step{train_step}")
 
 @hydra.main(version_base=None, config_path="configs", config_name="alina")
 def main(cfg: DictConfig) -> None:
@@ -296,7 +293,8 @@ def main(cfg: DictConfig) -> None:
     maximize_metrics = True
 
     device = torch.device(f"cuda:{cfg.const.DEVICE_IDX}" if torch.cuda.is_available() else "cpu")
-    run_name = f"{cfg.run_name_prefix}_{cfg.run_name_template.template}"
+    run_suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = f"{cfg.run_name_prefix}_{cfg.run_name_template.template}_{run_suffix}"
 
     #### lr scheduler ####
     lr_func = get_cexplr_scheduler(**lr_params)
@@ -305,23 +303,21 @@ def main(cfg: DictConfig) -> None:
     
     #### set up model and optim ####
     if (cfg.checkpoint_path is None):
-        ### create new model and optimizer
-        print("\nCreate model and optimizer...")
+        ### create new model
+        print("\nCreate model...")
         model = alina.AliNA(model_parameters,
                             dimer_embeddings = dimer_embeddings,
                             center_pad = center_pad)
-        optim = torch.optim.AdamW(model.parameters(), lr=1,
-                                  weight_decay=weight_decay, maximize=maximize)
         print("\tdone")
     else:
-        ### load model and optimizer
-        print("\nLoad model and optimizer...")
-        model, optim = load_checkpoint(cfg.checkpoint_path, device)
-        # update optim parameters
-        for param_group in optim.param_groups:
-            param_group['weight_decay'] = weight_decay 
-            param_group['maximize'] = maximize
+        ### load pretrained model weights
+        print("\nLoad pretrained model weights...")
+        model = load_model(cfg.checkpoint_path, device)
         print("\tdone")
+
+    ### always start from a fresh optimizer, even when resuming from a checkpoint
+    optim = torch.optim.AdamW(model.parameters(), lr=1,
+                              weight_decay=weight_decay, maximize=maximize)
         
           
     model = model.to(device)
@@ -335,29 +331,39 @@ def main(cfg: DictConfig) -> None:
 
     #### load train/valid datasets --> create DataLoaders ####
     train_dataset = AlinaDataset.load(cfg.data.train_data_path)
-    valid_dataset = AlinaDataset.load(cfg.data.valid_data_path)
+
+    # accept either a single valid_data_path (backward-compatible) or a
+    # name->path mapping under valid_data_paths
+    valid_data_paths = OmegaConf.select(cfg, "data.valid_data_paths", default=None)
+    if valid_data_paths is None:
+        valid_data_paths = {"valid": cfg.data.valid_data_path}
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=batch_size,
         shuffle=True, drop_last=True,
         collate_fn=alina.make_collate(max_len, center_pad=center_pad)
     )
-    
-    valid_loader = torch.utils.data.DataLoader(
-        valid_dataset, batch_size=batch_size,
-        shuffle=False, drop_last=False,
-        collate_fn=alina.make_collate(max_len, center_pad=center_pad)
-    )
+
+    valid_loaders = {}
+    for name, path in valid_data_paths.items():
+        valid_dataset = AlinaDataset.load(path)
+        valid_loaders[name] = torch.utils.data.DataLoader(
+            valid_dataset, batch_size=batch_size,
+            shuffle=False, drop_last=False,
+            collate_fn=alina.make_collate(max_len, center_pad=center_pad)
+        )
+
+    save_every = OmegaConf.select(cfg, "const.SAVE_EVERY", default=None)
 
     #### start mlflow experiment ####
     mlflow.start_run(run_name=run_name)
     mlflow.log_params(params)
     log_fn = mlflow.log_metric
     
-    train(model, train_loader, valid_loader, device,
+    train(model, train_loader, valid_loaders, device,
           optim, loss_fn, lr_scheduler, scaler, checkpointer, log_fn,
           log_every, valid_every, max_train_steps,
-          grad_acum, clip_grad)
+          grad_acum, clip_grad, save_every)
     print("\n---   Finished   ---")
 
 

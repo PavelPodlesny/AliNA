@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import List, Tuple, Union
 
+import pandas as pd
 import numpy as np
 import torch
 import naskit as nsk
@@ -111,7 +112,8 @@ def evaluate(
     threshold: Union[float, List[float]] = 0.5,
     batch_size: int = 8,
     device: Union[str, torch.device] = "cpu",
-    plot: bool = True
+    plot: bool = True,
+    with_probs: bool = False
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
 
     model = alina.AliNA.load(path=checkpoint_path)
@@ -146,7 +148,120 @@ def evaluate(
     if plot:
         _plot_diagnostics(fscores, precisions, recalls, tp_probs, fp_probs, fn_probs, best_threshold)
 
-    return fscores, precisions, recalls
+    if with_probs:
+        output = (fscores, precisions, recalls, tp_probs, fp_probs, fn_probs)
+    else:
+        output = (fscores, precisions, recalls)
+        
+    return output
 
 def sym_max(m, i, j):
     return max(float(m[i, j]), float(m[j, i]))
+
+def evaluate_models(
+    checkpoints: dict[str, Path],
+    datasets: dict[str, Path],
+    dataset2models: dict[str, list[str]],
+    device: str,
+    results_path: Path,
+    th: float = 0.5,
+) -> pd.DataFrame:
+    """
+    Run each model checkpoint on every dataset it's allowed to see, and compile a metrics dataframe.
+ 
+    Args:
+        checkpoints: {model_label: path_to_checkpoint}
+        datasets: {dataset_label: path_to_dataset}
+        dataset2models: {dataset_label: [model_labels allowed on this dataset]}
+                         A dataset is skipped for any model_label not listed here.
+        device: device string passed to evaluate(), e.g. 'cuda:0'
+        results_path: where to save the resulting dataframe (as .csv)
+        th: quantization threshold passed only to evaluate(); NOT used for the
+            Fscore>=0.8 / Fscore<0.5 columns, which are fixed regardless of th
+ 
+    Returns:
+        DataFrame indexed by model_label ('train protocol'), with one row per (dataset, model) pair
+        that was actually evaluated.
+    """
+    metric_cols = [
+        "Fscore==1.0",
+        "Fscore==0.0",
+        "Fscore>=0.8",
+        "Fscore<0.5",
+    ]
+    df_template_keys = [
+        "dataset",
+        "train protocol",
+        "quant TH",
+        "n",
+        "mean precision",
+        "mean recall",
+        "mean Fscore",
+        "median Fscore",
+        *metric_cols,
+    ]
+ 
+    raw_results: dict[str, dict[str, list]] = {}
+ 
+    for ds_label, allowed_models in dataset2models.items():
+        ds_path = datasets.get(ds_label)
+        if ds_path is None:
+            print(f"Warning: dataset '{ds_label}' not found in `datasets`, skipping.")
+            continue
+ 
+        print(f"\n{'#' * 100}\ndataset: {ds_label}\n{'#' * 100}\n")
+        raw_results[ds_label] = {key: [] for key in df_template_keys}
+ 
+        for model_label in allowed_models:
+            ckpt_path = checkpoints.get(model_label)
+            if ckpt_path is None:
+                print(f"Warning: model '{model_label}' not found in `checkpoints`, skipping "
+                      f"for dataset '{ds_label}'.")
+                continue
+ 
+            print(f"\nmodel: {model_label}\npath: {ds_path}\n")
+ 
+            fs, pr, rc = evaluate(
+                ckpt_path, ds_path,
+                threshold=th, device=device,
+                plot=False, with_probs=False,
+            )
+ 
+            print(f"{'-' * 100}\n")
+ 
+            r = raw_results[ds_label]
+            r["dataset"].append(ds_label)
+            r["train protocol"].append(model_label)
+            r["quant TH"].append(th)
+            r["n"].append(fs.shape[0])
+            r["mean precision"].append(float(np.round(np.mean(pr), 3)))
+            r["mean recall"].append(float(np.round(np.mean(rc), 3)))
+            r["mean Fscore"].append(float(np.round(np.mean(fs), 3)))
+            r["median Fscore"].append(float(np.round(np.median(fs), 3)))
+            r["Fscore==1.0"].append(int(np.sum(fs == 1.0)))
+            r["Fscore==0.0"].append(int(np.sum(fs == 0.0)))
+            r["Fscore>=0.8"].append(int(np.sum(fs >= 0.8)))
+            r["Fscore<0.5"].append(int(np.sum(fs < 0.5)))
+ 
+    dfs = []
+    for ds_label, metrics_dict in raw_results.items():
+        if not metrics_dict["dataset"]:
+            continue  # no model was actually evaluated on this dataset
+        df = pd.DataFrame(metrics_dict)
+        df = df.set_index("train protocol")
+        dfs.append(df)
+ 
+    if not dfs:
+        raise ValueError("No (dataset, model) pairs were evaluated — check `dataset2models`, "
+                          "`checkpoints`, and `datasets` for mismatched labels.")
+ 
+    results = pd.concat(dfs, axis=0)
+ 
+    for col in metric_cols:
+        results[f"{col}, pct"] = (results[col] / results["n"] * 100).round(2)
+ 
+    results_path = Path(results_path)
+    results_path.parent.mkdir(parents=True, exist_ok=True)
+    results.to_csv(results_path)
+ 
+    return results
