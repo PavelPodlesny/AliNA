@@ -169,7 +169,7 @@ def validate(model: Module,
     
     return loss, metrics
 
-@logger.catch
+@logger.catch(reraise=True)
 def train(model: Module,
           modules: dict[str, Any],
           config:  dict[str, Any],

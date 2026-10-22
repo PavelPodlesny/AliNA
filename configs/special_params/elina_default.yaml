@@ -3,5 +3,4 @@ compile_model : 0
 freeze_layers : []
 save_by : '_'
 loss_fn : 'CELoss'
-loss_fn_params:
-  pos_weight: 3.0
+loss_fn_params: {}
