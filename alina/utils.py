@@ -31,6 +31,32 @@ def MaskedCELoss(pred_m, coev_struct, true_struct):
     
     return CE
 
+def WeightedMaskedCELoss(pred_m, coev_struct, true_struct, pos_weight=2.0):
+    '''
+    Summary: как MaskedCELoss, но с усиленным штрафом за истинные пары (true_struct != -1),
+    чтобы модель не убирала их
+    Args:
+        pred_m.shape     : b, seq, seq+1
+        coev_struct.shape: b, seq
+        true_struct.shape: b, seq
+        pos_weight        : множитель штрафа для позиций с true_struct != -1
+    '''
+    batch, seq, seq1p = pred_m.shape
+    true_adj = torch.nn.functional.one_hot((true_struct+1).long(), num_classes=seq1p)
+    true_adj = true_adj.float().to(pred_m.device) # b,seq,seq+1
+
+    mask = (coev_struct!=-1).float().to(pred_m.device) # b,seq
+
+    logs = - true_adj*torch.log(pred_m + 1e-7)
+    logs = logs.sum(dim=-1) # b,seq,seq+1 -> b,seq
+
+    weights = torch.where(true_struct!=-1, pos_weight, 1.0).float().to(pred_m.device) # b,seq
+    logs = logs*mask*weights
+
+    CE = logs.sum() / mask.sum()
+
+    return CE
+
 def CELoss(pred_m, coev_struct, true_struct):
     '''
     Summary: для обычного предсказания вторички
@@ -49,6 +75,28 @@ def CELoss(pred_m, coev_struct, true_struct):
     CE = logs.mean()
     
     return CE
+
+class LossFn:
+    '''
+    Summary: унифицированная обёртка над функциями потерь, чтобы train loop
+    всегда вызывал loss_fn(pred_m, coev_struct, true_struct) независимо от
+    гиперпараметров конкретной функции (напр. pos_weight у WeightedMaskedCELoss)
+    '''
+    _REGISTRY = {
+        "CELoss": CELoss,
+        "MaskedCELoss": MaskedCELoss,
+        "WeightedMaskedCELoss": WeightedMaskedCELoss,
+    }
+
+    def __init__(self, name: str, **params):
+        if name not in self._REGISTRY:
+            raise ValueError(f"Unknown loss_fn_type: {name}, expected one of {list(self._REGISTRY)}")
+        self.name = name
+        self.fn = self._REGISTRY[name]
+        self.params = params
+
+    def __call__(self, pred_m, coev_struct, true_struct):
+        return self.fn(pred_m, coev_struct, true_struct, **self.params)
 
 def ClasMetrics(pred_m, inp, y, TH=0.5):
     """
@@ -179,7 +227,7 @@ class Checkpointer:
         if value <= self.best_value:
             return
             
-        best_name = f"best_val={value:.4f}_{name}"
+        best_name = f"best_val{value:.4f}_{name}"
         if self.best_model_name is not None:
             os.remove(self.dir_path/f"{self.best_model_name}.pth")
         self.best_value = value
