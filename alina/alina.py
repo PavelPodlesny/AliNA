@@ -92,7 +92,7 @@ class AliNA(Model):
                 print(f"Use 'ngs_mfe_augmented' model by default. "
                       f"You can choose from: ['pretrained_augmented', 'ngs_mfe_augmented']")
         
-        state = torch.load(path, map_location='cpu', weights_only=True)
+        state = torch.load(path, map_location='cpu', weights_only=False)
         model = cls(
             model_parameters = state["model_params"],
             dimer_embeddings = state["dimer_embeddings"],

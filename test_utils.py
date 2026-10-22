@@ -40,7 +40,10 @@ def _eval_at_threshold(model, target_nas, probs, threshold):
     fscores, precisions, recalls = [], [], []
     tp_probs, fp_probs, fn_probs = [], [], []
 
+    pred_nas = []
+
     for target_na, prob in zip(target_nas, probs):
+       #print(target_na.name) #debug!!!
         pred_na = _quantize_to_na(model, prob, threshold, target_na)
         fscore, precision, recall, tpp, fpp, fnp = _pair_metrics(target_na, pred_na, prob)
         fscores.append(fscore)
@@ -50,8 +53,10 @@ def _eval_at_threshold(model, target_nas, probs, threshold):
         fp_probs += fpp
         fn_probs += fnp
 
+        pred_nas.append(pred_na)
+
     return (np.array(fscores), np.array(precisions), np.array(recalls),
-            tp_probs, fp_probs, fn_probs)
+            tp_probs, fp_probs, fn_probs, pred_nas)
 
 
 def _hist_with_ticks(ax, values, title):
@@ -113,7 +118,7 @@ def evaluate(
     batch_size: int = 8,
     device: Union[str, torch.device] = "cpu",
     plot: bool = True,
-    with_probs: bool = False
+    with_probs_and_predictions: bool = False
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
 
     model = alina.AliNA.load(path=checkpoint_path)
@@ -131,7 +136,7 @@ def evaluate(
 
     if len(thresholds) == 1:
         best_threshold = thresholds[0]
-        fscores, precisions, recalls, tp_probs, fp_probs, fn_probs = _eval_at_threshold(
+        fscores, precisions, recalls, tp_probs, fp_probs, fn_probs, pred_nas = _eval_at_threshold(
             model, target_nas, probs, best_threshold
         )
     else:
@@ -139,7 +144,7 @@ def evaluate(
         best_threshold = max(results, key=lambda t: results[t][0].mean())
         if plot:
             _plot_threshold_sweep(thresholds, results, best_threshold)
-        fscores, precisions, recalls, tp_probs, fp_probs, fn_probs = results[best_threshold]
+        fscores, precisions, recalls, tp_probs, fp_probs, fn_probs, pred_nas = results[best_threshold]
 
     print(
         f"threshold={best_threshold}  fscore={fscores.mean():.4f}  "
@@ -148,8 +153,8 @@ def evaluate(
     if plot:
         _plot_diagnostics(fscores, precisions, recalls, tp_probs, fp_probs, fn_probs, best_threshold)
 
-    if with_probs:
-        output = (fscores, precisions, recalls, tp_probs, fp_probs, fn_probs)
+    if with_probs_and_predictions:
+        output = (fscores, precisions, recalls, tp_probs, fp_probs, fn_probs, pred_nas)
     else:
         output = (fscores, precisions, recalls)
         
@@ -224,7 +229,8 @@ def evaluate_models(
             fs, pr, rc = evaluate(
                 ckpt_path, ds_path,
                 threshold=th, device=device,
-                plot=False, with_probs=False,
+                plot=False,
+                with_probs_and_predictions=False,
             )
  
             print(f"{'-' * 100}\n")
