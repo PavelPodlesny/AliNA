@@ -87,6 +87,8 @@ class AliNA(Model):
                 path = package_path/"model"/"Pretrained_augmented.pth"
             elif model == "ngs_mfe_augmented":
                 path = package_path/"model"/"Ngs_mfe_augmented.pth"
+            elif model == "ngs_ribonanza_trained":
+                path = package_path/"model"/"Ngs_ribonanza_trained.pth"
             else:
                 path = package_path/"model"/"Ngs_mfe_augmented.pth"
                 print(f"Use 'ngs_mfe_augmented' model by default. "
