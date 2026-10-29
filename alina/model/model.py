@@ -3,7 +3,7 @@ import math
 import torch
 import torch.nn as nn
 
-from .modules import ComplementaryLayer, EncoderLayer, MSATransformer, make_encoder_block
+from .modules import EncoderLayer, MSATransformer, make_encoder_block
 
 
 class Model(nn.Module):
@@ -21,13 +21,11 @@ class Model(nn.Module):
                  skip_msa_att: bool
                 ):
         super().__init__()
-        
+
         self.dim = dim
-        self.final_dot_norm = math.sqrt(dim) # ???
-        
+
         # Embedding
         self.embedding = nn.Embedding(vocab_size, dim)
-        self.nb_embed = torch.nn.Parameter(torch.rand(dim), requires_grad=True) # NoBound vec
 
         # Conv Block
         self.conv_model = nn.Sequential()
@@ -44,105 +42,86 @@ class Model(nn.Module):
                 torch.nn.init.xavier_uniform_(layer.weight, gain=1.0)
                 self.conv_model.append(layer)
 
-        # Secondary structure
-        self.complementary_layer = ComplementaryLayer(dim)
-        
-        # MSA Transformer Block
+        # Sequence Transformer Block (MSA layers, used with a single-row "MSA")
         self.seq_encoders_block, self.seq_encoders_order = make_encoder_block(
             seq_encoders_order, dim, heads, encdrop,
             MSATransformer, norm_layer, skip_msa_att)
-        
+
         # Encoder Block
         self.struct_encoders_block, self.struct_encoders_order = make_encoder_block(
             struct_encoders_order, dim, heads, encdrop,
             EncoderLayer, norm_layer)
-        
-        # Head
+
+        # Head: per-nucleotide reactivity logit
         self.final_norm = norm_layer(dim)
-        self.DotW = torch.nn.Parameter(torch.rand((dim, dim)), requires_grad=True)
-        torch.nn.init.xavier_uniform_(self.DotW, gain=1.0)
-        self.final_bias = torch.nn.Parameter(torch.tensor(-3.0), requires_grad=True)
+        self.head = nn.Linear(dim, 1)
+        torch.nn.init.xavier_uniform_(self.head.weight, gain=1.0)
+        torch.nn.init.constant_(self.head.bias, 0.0)
+
+    @staticmethod
+    def to_prediction(raw: torch.Tensor) -> torch.Tensor:
+        """
+        Raw head output -> reactivity prediction: reactivity is non-negative, so negative outputs are clipped to 0
+        (no upper bound: reactivity is not bounded by 1). Not used in the loss: clamp has zero gradient below 0.
+        """
+        return raw.float().clamp(min=0.0)
 
 
     @torch.compile
     def pos_enc(self, seq: int, dim: int, start_idx: int, device: torch.device):
         div = torch.arange(dim, dtype=torch.float32, device=device)
         div = 10000**(2 * (div//2) / dim)
-        
+
         pos_enc = torch.arange(start_idx, seq+start_idx, dtype=torch.float32, device=device) # 1,...,seq if start_idx=1
         pos_enc = pos_enc.view(seq, 1).repeat(1, dim) / div
-        
+
         pos_enc[:, 0::2] = torch.sin(pos_enc[:, 0::2]) # dim 2i
         pos_enc[:, 1::2] = torch.cos(pos_enc[:, 1::2]) # dim 2i+1
 
         return pos_enc
-        
-            
-    def forward(self, seq: torch.Tensor, struct_vec: torch.Tensor): 
-        batch, msa_len, seq_len = seq.shape
-        x = self.embedding(seq) # b, msa, seq, dim
-        
-        x = x.view(batch*msa_len, seq_len, self.dim).transpose(1,2) # b+msa, dim, seq
-        x = self.conv_model(x)
-        x = x.transpose(1,2).reshape(batch, msa_len, seq_len, self.dim) # b, msa, seq, dim
 
-        seq_mask = (seq==0).to(x.dtype).view(-1, 1, 1, seq_len) # b, msa, seq -> b+msa, 1, 1, seq
-        msa_mask = (seq.sum(dim=-1) == 0).to(x.dtype) # b, msa
-        # b, msa -> b, 1, msa -> b, seq, msa -> b*seq, 1, 1, msa
-        msa_mask = msa_mask.unsqueeze(1).expand(-1, seq_len, -1).reshape(batch * seq_len, 1, 1, msa_len)
-        
+
+    def forward(self, seq: torch.Tensor, raw: bool = False):
+        """
+        Args:
+            seq: (b, L) int tokens, 0 = pad
+            raw: return the raw (unclipped) head output, which is what the loss is computed on
+        Returns:
+            (b, L) reactivity prediction clipped to >= 0 (or the raw head output)
+        """
+        # assert seq.dim() == 2, f"expected seq of shape (b, L), got {tuple(seq.shape)}"
+        batch, seq_len = seq.shape
+
+        # pad positions are zeroed at every conv input, otherwise the k=3 convs leak
+        # pad embeddings into the last real nucleotides and outputs depend on batch padding
+        pad = (seq!=0).unsqueeze(1) # b, 1, seq
+        x = self.embedding(seq).transpose(1,2) # b, dim, seq
+        x = x * pad.to(x.dtype)
+        for layer in self.conv_model:
+            x = layer(x)
+            x = x * pad.to(x.dtype)
+        x = x.transpose(1,2) # b, seq, dim
+
+        seq_mask = (seq==0).to(x.dtype).view(batch, 1, 1, seq_len) # b, seq -> b, 1, 1, seq
+
+        # seq encoders work on (b, msa, seq, dim); here msa = 1
+        x = x.unsqueeze(1) # b, 1, seq, dim
+        msa_mask = torch.zeros((batch * seq_len, 1, 1, 1), dtype=x.dtype, device=x.device)
         for li in self.seq_encoders_order:
             l = self.seq_encoders_block[li]
             x = l(x, msa_mask, seq_mask)
-            
-        x = x[:,0,:,:]   # batch, msa, seq, dim -> batch, seq, dim
+
+        x = x[:,0,:,:]   # batch, 1, seq, dim -> batch, seq, dim
         x = x + self.pos_enc(x.size(1), x.size(2), start_idx=1, device=x.device).to(x.dtype)
-        # graph layer
-        x = self.complementary_layer(x, struct_vec)
-        # add nb embed
-        nb_embed = self.nb_embed.view(1,1,-1).expand(batch, 1, -1) # dim -> 1,1,dim -> b, 1, dim
-        x = torch.cat((nb_embed, x), dim=1) # b, seq+1, dim
-        
-        # struct att mask
-        seq = seq[:,0,:] # batch, msa, seq -> b, seq
-        nb_pad = torch.ones((batch, 1), dtype=seq.dtype, device=seq.device) # b,1
-        seq = torch.cat((nb_pad, seq), dim=1) # b, seq+1
-        att_mask = (seq==0).to(x.dtype).view(seq.size(0), 1, 1, seq.size(1)) # b, seq -> b, 1, 1, seq
-        # struct encoders
+
+        # encoders
         for li in self.struct_encoders_order:
             l = self.struct_encoders_block[li]
-            x, _ = l(x, att_mask) # b,seq+1,dim
+            x, _ = l(x, seq_mask) # b, seq, dim
 
         x = self.final_norm(x)
-        x = torch.matmul(
-            torch.matmul(x, self.DotW), # b,seq+1,dim @ dim,dim -> b,seq+1,dim
-            torch.transpose(x, 1, 2) # b,seq+1,dim -> b,dim,seq+1
-        ) # b,seq+1,dim @ b,dim,seq+1 -> b, seq+1, seq+1
-        x = x / self.final_dot_norm
-        x = x + self.final_bias
-        x = x - 1e7 * torch.eye(x.size(1), dtype=x.dtype, device=x.device).unsqueeze(0)
+        out = self.head(x).squeeze(-1) # b, seq, dim -> b, seq
 
-        nbn, m = x[:,0], x[:,1:] # b, seq+1 | b, seq, seq+1
-        nbn = torch.sigmoid(nbn)
-        m = torch.nn.functional.softmax(m, dim=-1)
-        
-        return nbn, m
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-        
+        if raw:
+            return out
+        return self.to_prediction(out)

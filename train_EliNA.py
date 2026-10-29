@@ -87,8 +87,9 @@ def main(cfg: DictConfig):
         ds = AlinaDataset.load(path)
         valid_data[label] = ds
         
+    valid_sizes = ", ".join([str(len(ds)) for ds in valid_data.values()])
     logger.success(f"Loaded train dataset ({len(train_dataset)}) and "
-                   f"{len(valid_data)} valid dataset(s) ({", ".join([str(len(ds)) for ds in valid_data.values()])})")
+                   f"{len(valid_data)} valid dataset(s) ({valid_sizes})")
 
     # 4. Setup Model & Optimizer
     model, optim = setup_model_optimizer(

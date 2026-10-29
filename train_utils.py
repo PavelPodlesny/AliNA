@@ -13,8 +13,9 @@ from torch.nn import Module
 from pathlib import Path
 from typing import Any
 
-from alina.utils import ClasMetrics, PredMetrics, LossFn, get_cexplr_scheduler, Checkpointer, GpuWatch
+from alina.utils import ClasMetrics, PredMetrics, ReactMetrics, LossFn, get_cexplr_scheduler, Checkpointer, GpuWatch
 from alina.dataset import AlinaDataset, collate_fn
+from alina.model import Model
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
@@ -86,7 +87,16 @@ def setup_train_modules(
     loss_fn_type   = config['special_params']['loss_fn']
     loss_fn_params = config['special_params'].get('loss_fn_params', {})
     
-    assert model_task in ["p","c"], f"unknown model task: expected 'p' or 'c', got {model_task}"
+    assert model_task in ["p","c","r"], f"unknown model task: expected 'p', 'c' or 'r', got {model_task}"
+    if model_task in ["p","c"]:
+        raise NotImplementedError(
+            f"model_task='{model_task}' is unsupported on the `react` branch: the model takes a sequence only "
+            "and predicts reactivity, use model_task='r'")
+
+    datasets = {"train": train_data, **valid_data}
+    for label, ds in datasets.items():
+        ds_task = getattr(ds, "task", "s")
+        assert ds_task == "r", f"model_task='r' needs datasets with task='r', but '{label}' has task='{ds_task}'"
     
     work_dir = Path(work_dir)
 
@@ -109,6 +119,8 @@ def setup_train_modules(
         (loss_fn_type in ["MaskedCELoss", "WeightedMaskedCELoss"])
         ) or (
             (model_task=="p") and (loss_fn_type in ["CELoss"])
+        ) or (
+            (model_task=="r") and (loss_fn_type in ["MaskingSoftBCELoss", "MaskingMSELoss", "MaskingMAELoss"])
         ), f"Invalid 'model_task'/'loss_fn_type' combination, got: {model_task}, {loss_fn_type}"
 
     loss_fn = LossFn(loss_fn_type, **loss_fn_params)
@@ -117,25 +129,80 @@ def setup_train_modules(
         metrics_fn = ClasMetrics
     elif model_task == "p":
         metrics_fn = PredMetrics
+    elif model_task == "r":
+        metrics_fn = ReactMetrics
+
+    # torch.amp.GradScaler appeared in torch 2.3
+    scaler = torch.amp.GradScaler("cuda") if hasattr(torch.amp, "GradScaler") else torch.cuda.amp.GradScaler()
         
     modules['optim']         = optim
-    modules['scaler']        = torch.amp.GradScaler("cuda")
+    modules['scaler']        = scaler
     modules['log_fn']        = mlflow.log_metric
     modules['loss_fn']       = loss_fn
     modules['metrics_fn']    = metrics_fn
     modules['train_loader']  = train_loader
-    modules["checkpointer"]  = Checkpointer(work_dir / model_name, model, optim)
+    # reactivity: the best model has the lowest MAE, structure tasks: the highest Fscore
+    modules["checkpointer"]  = Checkpointer(work_dir / model_name, model, optim,
+                                            mode="min" if model_task=="r" else "max")
     modules['lr_scheduler']  = LambdaLR(optim, lr_lambda=lr_func)
     modules['valid_loaders'] = valid_loaders
 
     return modules 
 
 
-def validate(model: Module,
+def react_prediction(out: torch.Tensor, loss_fn: Any) -> torch.Tensor:
+    """
+    Raw model output (raw=True) -> reactivity prediction used by the metrics:
+    BCE treats the output as a logit (sigmoid -> [0, 1]), MSE/MAE regress the raw output, which is clipped
+    to >= 0 exactly like the model does at inference (Model.to_prediction)
+    """
+    out = out.detach().float()
+    return torch.sigmoid(out) if loss_fn.name == "MaskingSoftBCELoss" else Model.to_prediction(out)
+
+def validate_react(model: Module,
+                   loader: DataLoader,
+                   loss_fn: Any,
+                   metrics_fn: Any,
+                   verbose: bool = False):
+    """
+    Loss is averaged over valid positions, metrics are computed once over all valid positions of the loader
+    """
+    device = model.device
+    iterf = tqdm.tqdm if verbose else iter
+
+    loss_sum, n_valid = 0, 0
+    preds, ys = [], []
+
+    model.eval()
+    with torch.no_grad():
+        for b in iterf(loader):
+            b = b.to(device)
+            raw_out = model(b.seq, raw=True)
+
+            valid = ~torch.isnan(b.reactivity)
+            loss_sum += loss_fn(raw_out, b.reactivity).item() * valid.sum().item()
+            n_valid += valid.sum().item()
+
+            preds.append(react_prediction(raw_out, loss_fn)[valid].cpu())
+            ys.append(b.reactivity[valid].cpu())
+
+    model.train()
+
+    metrics = metrics_fn(torch.cat(preds), torch.cat(ys))
+    loss = loss_sum / max(n_valid, 1)
+
+    return loss, metrics
+
+def validate_struct(
+             model: Module,
              loader: DataLoader,
              loss_fn: Any,
              metrics_fn: Any,
              verbose: bool = False):
+             #model_task: str = "c"):
+
+    # if model_task == "r":
+    #     return validate_react(model, loader, loss_fn, metrics_fn, verbose)
     
     device = model.device
     iterf = tqdm.tqdm if verbose else iter
@@ -198,6 +265,12 @@ def train(model: Module,
     grad_acum       = train_const['GRAD_ACUM']
 
 
+    model_task = config["special_params"]["model_task"]
+    is_react = (model_task == "r")
+    # metric of the best checkpoint (see Checkpointer mode in setup_train_modules)
+    save_metric = "MAE" if is_react else "Fscore"
+    validate_fn = validate_react if is_react else validate_struct
+
     save_by = config["special_params"]["save_by"]
     vds_keys = list(valid_loaders.keys())
     assert save_by in vds_keys, f"v.loaders: {vds_keys}, but got save_by = {save_by}"
@@ -212,12 +285,13 @@ def train(model: Module,
     gw = GpuWatch(DEVICE_IDX)
     # prevalidation
     for label, vloader in valid_loaders.items():
-        vloss, vmetrics = validate(model, vloader, loss_fn, metrics_fn, False)
-        logger.info(f"{label} preval.: loss={vloss:.2f}, Fscore={vmetrics["Fscore"]:.2f} ")
+        vloss, vmetrics = validate_fn(model, vloader, loss_fn, metrics_fn, False)
+        vmetrics_str = ", ".join(f"{k}={v:.2f}" for k, v in vmetrics.items())
+        logger.info(f"{label} preval.: loss={vloss:.2f}, {vmetrics_str}")
     
     #mloss, recall, precision, tp_ratio, fp_ratio, Fscore = 0, 0, 0, 0, 0, 0
     mloss = 0
-    metrics = {}
+    metrics, metrics_cnt = {}, {} # NaN metrics (e.g., undefined correlation) are skipped, so counted separately
     # main train loop: 1 iteration = 1 epoach 
     while (train_step<MAX_TRAIN_STEPS):
         ep+=1
@@ -225,23 +299,28 @@ def train(model: Module,
             global_step += 1
             b = b.to(device)
 
-            seq, inp, y = b.seq, b.inp_struct, b.out_struct
-            
-            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-                _, pred_m = model(seq, inp)
-    
-            loss = loss_fn(pred_m, inp, y)
-            mloss += loss.item()
+            if is_react:
+                with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    raw_out = model(b.seq, raw=True)
 
+                loss = loss_fn(raw_out, b.reactivity)
+                metrics_batch = metrics_fn(react_prediction(raw_out, loss_fn), b.reactivity)
+            else:
+                seq, inp, y = b.seq, b.inp_struct, b.out_struct
+                
+                with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    _, pred_m = model(seq, inp)
+        
+                loss = loss_fn(pred_m, inp, y)
+                metrics_batch = metrics_fn(pred_m, inp, y)
+
+            mloss += loss.item()
             loss = loss / grad_acum
             
-            metrics_batch = metrics_fn(pred_m, inp, y)
-            
-            if len(metrics) == 0:
-                metrics = {k:v for k, v in metrics_batch.items()}
-            else:
-                for k, v in metrics_batch.items():
-                    metrics[k] += v
+            for k, v in metrics_batch.items():
+                if v == v: # skip NaN
+                    metrics[k] = metrics.get(k, 0) + v
+                    metrics_cnt[k] = metrics_cnt.get(k, 0) + 1
                     
             scaler.scale(loss).backward() # calculate gradient
 
@@ -263,7 +342,7 @@ def train(model: Module,
                     log_fn('Loss', mloss / grad_acum, train_step)
 
                     for k, v in metrics.items():
-                        log_fn(k, v / grad_acum, train_step)
+                        log_fn(k, v / metrics_cnt[k], train_step)
                         
                     log_fn('Lr', lr_scheduler.get_last_lr()[0], train_step)
                     log_fn('step/s', stepps, train_step)
@@ -276,19 +355,20 @@ def train(model: Module,
                     print(f"\rvalidation ...", end='')
                     for label, vloader in valid_loaders.items():
                         
-                        vloss, vmetrics = validate(model, vloader, loss_fn, metrics_fn, False)
+                        vloss, vmetrics = validate_fn(model, vloader, loss_fn, metrics_fn, False, model_task)
                         log_fn(f"{label}_valid_Loss", float(vloss), train_step)
 
                         for k, v in vmetrics.items():
-                            log_fn(f"{label}_valid_{k}", v, train_step)
+                            if v == v: # skip NaN
+                                log_fn(f"{label}_valid_{k}", v, train_step)
                             
-                        if label == save_by:
-                            checkpointer.save_by_metric(f"{label}_step{train_step}", vmetrics["Fscore"])
+                        if label == save_by and vmetrics[save_metric] == vmetrics[save_metric]:
+                            checkpointer.save_by_metric(f"{label}_step{train_step}", vmetrics[save_metric])
 
                 if SAVE_EVERY is not None and train_step%SAVE_EVERY==0:
                     checkpointer(f"step{train_step}")
 
-                metrics = {}
+                metrics, metrics_cnt = {}, {}
                 mloss = 0
 
             itps = 1/(time.time() - iter_start_time)

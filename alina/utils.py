@@ -76,16 +76,68 @@ def CELoss(pred_m, coev_struct, true_struct):
     
     return CE
 
+def MaskingSoftBCELoss(logits, y):
+    '''
+    Summary: BCE with soft labels for reactivity; positions with NaN in y (not measured / pad) are masked
+    Args:
+        logits.shape: b, seq (raw model output, before sigmoid)
+        y.shape     : b, seq (reactivity in [0, 1], NaN = masked)
+    '''
+    y = y.to(logits.device)
+    valid = ~torch.isnan(y) # b,seq
+    y = torch.nan_to_num(y, nan=0.0).float() # NaN * 0 is still NaN, so replace it before the product
+
+    loss = torch.nn.functional.binary_cross_entropy_with_logits(logits.float(), y, reduction="none")
+    loss = loss * valid
+
+    return loss.sum() / valid.sum().clamp(min=1)
+
+def MaskingMSELoss(pred, y):
+    '''
+    Summary: MSE for (unbounded) reactivity regression; positions with NaN in y (not measured / pad) are masked
+    Args:
+        pred.shape: b, seq (raw model output, i.e. forward(..., raw=True), NO sigmoid, NOT clipped)
+        y.shape   : b, seq (reactivity, any range, NaN = masked)
+    '''
+    y = y.to(pred.device)
+    valid = ~torch.isnan(y) # b,seq
+    y = torch.nan_to_num(y, nan=0.0).float() # NaN * 0 is still NaN, so replace it before the product
+
+    loss = (pred.float() - y) ** 2
+    loss = loss * valid
+
+    return loss.sum() / valid.sum().clamp(min=1)
+
+def MaskingMAELoss(pred, y):
+    '''
+    Summary: MAE (L1) for (unbounded) reactivity regression; positions with NaN in y (not measured / pad) are masked
+    Args:
+        pred.shape: b, seq (raw model output, i.e. forward(..., raw=True), NOT clipped)
+        y.shape   : b, seq (reactivity, any range, NaN = masked)
+    '''
+    y = y.to(pred.device)
+    valid = ~torch.isnan(y) # b,seq
+    y = torch.nan_to_num(y, nan=0.0).float() # NaN * 0 is still NaN, so replace it before the product
+
+    loss = (pred.float() - y).abs()
+    loss = loss * valid
+
+    return loss.sum() / valid.sum().clamp(min=1)
+
 class LossFn:
     '''
     Summary: унифицированная обёртка над функциями потерь, чтобы train loop
     всегда вызывал loss_fn(pred_m, coev_struct, true_struct) независимо от
-    гиперпараметров конкретной функции (напр. pos_weight у WeightedMaskedCELoss)
+    гиперпараметров конкретной функции (напр. pos_weight у WeightedMaskedCELoss);
+    для реактивности вызывается как loss_fn(raw_output, reactivity)
     '''
     _REGISTRY = {
         "CELoss": CELoss,
         "MaskedCELoss": MaskedCELoss,
         "WeightedMaskedCELoss": WeightedMaskedCELoss,
+        "MaskingSoftBCELoss": MaskingSoftBCELoss,
+        "MaskingMSELoss": MaskingMSELoss,
+        "MaskingMAELoss": MaskingMAELoss,
     }
 
     def __init__(self, name: str, **params):
@@ -95,8 +147,8 @@ class LossFn:
         self.fn = self._REGISTRY[name]
         self.params = params
 
-    def __call__(self, pred_m, coev_struct, true_struct):
-        return self.fn(pred_m, coev_struct, true_struct, **self.params)
+    def __call__(self, *args):
+        return self.fn(*args, **self.params)
 
 def ClasMetrics(pred_m, inp, y, TH=0.5):
     """
@@ -174,6 +226,51 @@ def PredMetrics(pred_m, inp, y, TH=0.5):
 
     return metrics
 
+def _rankdata(x):
+    """average ranks (1-based), ties get the mean of their ranks"""
+    sorted_x, idx = torch.sort(x)
+    _, inverse, counts = torch.unique_consecutive(sorted_x, return_inverse=True, return_counts=True)
+    ends = counts.cumsum(0)
+    avg = (2*ends - counts + 1).to(torch.float64) / 2 # (start + end) / 2, start = end - count + 1
+    ranks = torch.empty_like(x, dtype=torch.float64)
+    ranks[idx] = avg[inverse]
+    return ranks
+
+def _pearson(a, b):
+    a, b = a - a.mean(), b - b.mean()
+    den = torch.sqrt((a*a).sum() * (b*b).sum())
+    if den == 0:
+        return float("nan") # constant input, correlation is undefined
+    return float((a*b).sum() / den)
+
+def ReactMetrics(pred, y):
+    """
+    Summary: для предсказания реактивности; считается по позициям, где y не NaN
+    Args:
+        pred: (batch, seq)  - probs in [0, 1]
+        y:    (batch, seq)  - ground truth (NaN for not measured/pad)
+    Returns: dict with MAE, RMSE, Pearson, Spearman (NaN if undefined)
+    """
+    y = y.to(pred.device)
+    valid = ~torch.isnan(y)
+    p, t = pred[valid].detach().to(torch.float64), y[valid].to(torch.float64)
+
+    if p.numel() == 0:
+        return {"MAE": float("nan"), "RMSE": float("nan"),
+                "Pearson": float("nan"), "Spearman": float("nan")}
+
+    err = p - t
+    metrics = {"MAE" : float(err.abs().mean()),
+               "RMSE": float(torch.sqrt((err**2).mean())),
+               "Pearson" : float("nan"),
+               "Spearman": float("nan")}
+
+    if p.numel() > 1:
+        metrics["Pearson"]  = _pearson(p, t)
+        metrics["Spearman"] = _pearson(_rankdata(p), _rankdata(t))
+
+    return metrics
+
 def get_cexplr_scheduler(warmup=200, peak=5e-4, c=4e-4, 
                          min_lr=5.e-5, max_lr=1.e-3,
                          rules=[]
@@ -208,11 +305,13 @@ class GpuWatch:
         return int(mem_info.used / (1024**2)), util_info.gpu
 
 class Checkpointer:
-    def __init__(self, dir_path, model, optim):
+    def __init__(self, dir_path, model, optim, mode="max"):
+        assert mode in ("max", "min"), f"mode must be 'max' or 'min', got {mode}"
         self.dir_path = Path(dir_path)
         self.model = model
         self.optim = optim
-        self.best_value = -1 * float("inf")
+        self.mode = mode
+        self.best_value = -1 * float("inf") if mode == "max" else float("inf")
         self.best_model_name = None
     
     def __call__(self, name):
@@ -224,7 +323,8 @@ class Checkpointer:
         torch.save(state, self.dir_path/f"{name}.pth")
         
     def save_by_metric(self, name, value):
-        if value <= self.best_value:
+        if (self.mode == "max" and value <= self.best_value) or \
+           (self.mode == "min" and value >= self.best_value):
             return
             
         best_name = f"best_val{value:.4f}_{name}"

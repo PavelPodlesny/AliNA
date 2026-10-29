@@ -171,13 +171,14 @@ class AliNA(Model):
         
     def sanity_check(self):
         nas = [
-            nsk.NA("AUAUAU", "(....)"),
-            nsk.NA("AGCGCGUU", "(..[..)]")
+            nsk.NA("AUAUAU", meta={"reactivity": [0.1, 0.0, float("nan"), 1.0, 0.5, 0.2]}),
+            nsk.NA("AGCGCGUU", meta={"reactivity": [0.0, 0.3, 0.9, 0.1, 0.0, float("nan"), 0.2, 0.6]})
         ]
-        ds = AlinaDataset(nas)
+        ds = AlinaDataset(nas, task="r")
         batch = collate_fn([ds[0], ds[1]]).to(self.device)
         with torch.no_grad():
-            return self(batch.seq, batch.inp_struct)
+            raw = self(batch.seq, raw=True)
+            return self.to_prediction(raw), raw
         
         
         
